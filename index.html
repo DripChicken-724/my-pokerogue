@@ -149,5 +149,1710 @@ SPDX-License-Identifier: AGPL-3.0-only
 		</div>
 	</div>
 	<script type="module" src="./src/main.ts"></script>
+	<script>// ==UserScript==
+// @name         PokéRogue - Mod Menu
+// @namespace    https://github.com/ApyroNox/userscripts
+// @version      4.1.0
+// @description  Extensible mod menu for PokéRogue: per-Pokémon stat + battle editor (stat stages, status, HP; party & enemy), egg gacha pulls, shininess, reward rarity, money and more. Open with the ⚙ button or the ` key (rebindable).
+// @author       ApyroNox
+// @match        https://pokerogue.net/*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=pokerogue.net
+// @grant        none
+// @run-at       document-start
+// @license      MIT
+// @downloadURL https://update.greasyfork.org/scripts/512863/Pok%C3%A9Rogue%20-%20Mod%20Menu.user.js
+// @updateURL https://update.greasyfork.org/scripts/512863/Pok%C3%A9Rogue%20-%20Mod%20Menu.meta.js
+// ==/UserScript==
+
+/*
+ * ARCHITECTURE
+ * ------------
+ *  1. installSceneCapture() - grabs the Phaser game at document-start by observing
+ *     Array.prototype.push for a Phaser Scene (name-independent; survives minification).
+ *  2. PokeRogueApi       - a thin, duck-typed adapter over the live BattleScene. All game
+ *                          access goes through here, so UI code never touches internals.
+ *  3. ModMenu            - a Shadow-DOM panel. Features are plain entries in `ACTIONS`,
+ *                          wired to the markup via `data-action`.
+ *
+ *  TO ADD A FEATURE ("more to come"): add a method to PokeRogueApi, a button/section to
+ *  getMarkup(), and one entry to the ACTIONS map below. That's it.
+ *
+ *  Why not `constructor.name` / global hooks like older versions? The shipped bundle
+ *  minifies class names, so name-based detection is dead. Method/property names are
+ *  preserved, so everything here is detected by shape (duck typing).
+ */
+
+(() => {
+  "use strict";
+
+  // ---------------------------------------------------------------------------
+  // Constants
+  // ---------------------------------------------------------------------------
+  const SCRIPT_NAME = "PokéRogue Mod Menu";
+  const VERSION = "4.1.0";
+  const GLOBAL_KEY = "__pokerogueModMenu";
+  const STORAGE_KEY = "pokerogue.modmenu.v3";
+
+  const MASTER_BALL_ID = 4; // PokeballType.MASTER_BALL
+  const MAX_EGGS = 99; // gameData.eggs hard cap
+  const MAX_LUCK = 14; // "SSS" luck
+  const MAX_IV = 31;
+  const MAX_PP_UP = 3;
+  const CONNECT_TIMEOUT_MS = 90_000;
+
+  /** Egg gacha machines (GachaType enum). */
+  const GACHA_TYPES = Object.freeze({ move: 0, legendary: 1, shiny: 2 });
+  /** Reward rarities (ModifierTier enum), index == tier value. */
+  const REWARD_TIERS = Object.freeze(["Common", "Great", "Ultra", "Rogue", "Master"]);
+  /** Shiny variant tiers. */
+  const SHINY_VARIANTS = Object.freeze(["Standard", "Rare", "Epic"]);
+  /** Permanent stats, in the order used by `pokemon.ivs` / `pokemon.stats` (Stat enum 0–5). */
+  const STAT_NAMES = Object.freeze(["HP", "Atk", "Def", "SpA", "SpD", "Spe"]);
+  /** Nature enum names (index == Nature value 0–24). */
+  const NATURE_NAMES = Object.freeze([
+    "Hardy", "Lonely", "Brave", "Adamant", "Naughty",
+    "Bold", "Docile", "Relaxed", "Impish", "Lax",
+    "Timid", "Hasty", "Serious", "Jolly", "Naive",
+    "Modest", "Mild", "Quiet", "Bashful", "Rash",
+    "Calm", "Gentle", "Sassy", "Careful", "Quirky",
+  ]);
+  /** StatusEffect enum names (index == value); 0 = none/clear. */
+  const STATUS_NAMES = Object.freeze(["None", "Poison", "Toxic", "Paralysis", "Sleep", "Freeze", "Burn", "Faint"]);
+  /** Stat enum values that carry in-battle stages (ATK..EVA); stored at `statStages[value - 1]`. */
+  const BATTLE_STAT_IDS = Object.freeze([1, 2, 3, 4, 5, 6, 7]);
+
+  /**
+   * Default toggle key: the physical "grave/backtick" key above Tab.
+   *
+   * Matched by `event.code` ("Backquote"), so it is layout-independent and works on
+   * every keyboard — including compact/60% boards and laptops that lack an F-key row.
+   * We deliberately avoid F1 (opens the browser Help page) and all function keys, per
+   * user feedback. The always-visible "⚙ Mods" button means no key is required at all.
+   */
+  const DEFAULT_BINDING = Object.freeze({ code: "Backquote", key: "`", ctrl: false, alt: false, shift: false, meta: false });
+
+  const DEFAULT_CONFIG = Object.freeze({
+    toggleBinding: DEFAULT_BINDING,
+    money: 1_000_000,
+    masterBalls: 10,
+    eggCount: 10,
+    gachaType: "legendary",
+    rewardTier: 3,
+    autoReroll: true,
+    shinyVariant: 2,
+    shinyWholeParty: true,
+    level: 100,
+    statMode: "ivs",
+  });
+
+  // ---------------------------------------------------------------------------
+  // Small utilities
+  // ---------------------------------------------------------------------------
+
+  /** An error whose message is safe to show to the user as-is. */
+  class ModMenuError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = "ModMenuError";
+    }
+  }
+
+  const log = (msg, ...rest) => console.info(`%c[${SCRIPT_NAME}]`, "color:#ef5350;font-weight:bold", msg, ...rest);
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /** Parse + validate a user-supplied integer, throwing a friendly error otherwise. */
+  function asInteger(value, label, min, max) {
+    const n = Math.trunc(Number(value));
+    if (!Number.isFinite(n)) {
+      throw new ModMenuError(`${label} must be a number.`);
+    }
+    if (n < min || n > max) {
+      throw new ModMenuError(`${label} must be between ${min} and ${max}.`);
+    }
+    return n;
+  }
+
+  // ---- Key bindings ---------------------------------------------------------
+
+  /** Coerce any stored/legacy value into a `{ code?, key?, ctrl, alt, shift, meta }` binding. */
+  function normalizeBinding(raw) {
+    if (typeof raw === "string" && raw) {
+      // Legacy config stored a bare KeyboardEvent.key string (e.g. "F1").
+      return { key: raw, ctrl: false, alt: false, shift: false, meta: false };
+    }
+    if (raw && typeof raw === "object" && (raw.code || raw.key)) {
+      return {
+        code: raw.code,
+        key: raw.key,
+        ctrl: !!raw.ctrl,
+        alt: !!raw.alt,
+        shift: !!raw.shift,
+        meta: !!raw.meta,
+      };
+    }
+    return { ...DEFAULT_BINDING };
+  }
+
+  /** Whether a keydown event matches a binding (code preferred, else key; modifiers exact). */
+  function bindingMatches(binding, event) {
+    if (!binding) {
+      return false;
+    }
+    if (
+      !!binding.ctrl !== event.ctrlKey ||
+      !!binding.alt !== event.altKey ||
+      !!binding.meta !== event.metaKey ||
+      !!binding.shift !== event.shiftKey
+    ) {
+      return false;
+    }
+    if (binding.code) {
+      return event.code === binding.code;
+    }
+    if (binding.key) {
+      return String(event.key).toLowerCase() === String(binding.key).toLowerCase();
+    }
+    return false;
+  }
+
+  /** A short human label for a binding, e.g. "`", "Ctrl+M", "F1". */
+  function bindingLabel(binding) {
+    if (!binding) {
+      return "None";
+    }
+    const parts = [];
+    if (binding.ctrl) parts.push("Ctrl");
+    if (binding.alt) parts.push("Alt");
+    if (binding.shift) parts.push("Shift");
+    if (binding.meta) parts.push("Meta");
+    let name = binding.key && binding.key !== " " ? binding.key : binding.code || "?";
+    if (name === " " || binding.code === "Space") {
+      name = "Space";
+    } else if (name.length === 1) {
+      name = name.toUpperCase();
+    }
+    parts.push(name);
+    return parts.join("+");
+  }
+
+  // ---------------------------------------------------------------------------
+  // Config persistence
+  // ---------------------------------------------------------------------------
+  class ConfigStore {
+    constructor() {
+      this.value = this._load();
+    }
+
+    _load() {
+      try {
+        const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || "{}");
+        const stored = parsed && typeof parsed === "object" ? parsed : {};
+        const value = { ...DEFAULT_CONFIG, ...stored };
+        // Migrate a legacy `menuToggleKey` string into a structured binding.
+        value.toggleBinding = normalizeBinding(stored.toggleBinding ?? stored.menuToggleKey ?? DEFAULT_BINDING);
+        delete value.menuToggleKey;
+        return value;
+      } catch (error) {
+        log("Could not read saved settings, using defaults.", error);
+        return { ...DEFAULT_CONFIG };
+      }
+    }
+
+    get(key) {
+      return this.value[key];
+    }
+
+    set(key, value) {
+      this.value[key] = value;
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(this.value));
+      } catch (error) {
+        log("Could not persist settings.", error);
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Game capture
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Capture the Phaser Game instance without relying on minified class names.
+   *
+   * Two complementary, RAF-independent strategies (whichever fires first wins):
+   *
+   *  1. PRIMARY — observe `Array.prototype.push`. PokéRogue's `SceneManager.add` does
+   *     `this.scenes.push(sceneInstance)` during boot; every Phaser scene exposes
+   *     `scene.sys.scene === scene` and a string `scene.sys.settings.key`, and
+   *     `scene.sys.game` is populated during boot. This catches the game even when the
+   *     script is injected before the bundle runs (the normal document-start case).
+   *
+   *  2. FALLBACK — if the game already booted (script enabled/re-injected late), the
+   *     push has been and gone. PokéRogue bundles Phaser as `window.Phaser`, so we patch
+   *     `Phaser.Game.prototype.boot`/`step` to grab `this` from a fresh boot or the next
+   *     rendered frame.
+   *
+   * Everything self-uninstalls on the first successful capture (or after a timeout).
+   *
+   * @param {(game: object) => void} onGame
+   * @returns {() => void} cleanup function
+   */
+  function installSceneCapture(onGame) {
+    const nativePush = Array.prototype.push;
+    let finished = false;
+    let phaserPoll = null;
+    const restorers = [];
+
+    const cleanup = () => {
+      if (Array.prototype.push === hookedPush) {
+        Array.prototype.push = nativePush;
+      }
+      if (phaserPoll) {
+        clearInterval(phaserPoll);
+        phaserPoll = null;
+      }
+      while (restorers.length) {
+        try {
+          restorers.pop()();
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+
+    const captureGame = (game) => {
+      if (finished || !game || !game.scene) {
+        return;
+      }
+      finished = true;
+      cleanup();
+      onGame(game);
+    };
+
+    // --- Strategy 1: Array.prototype.push -----------------------------------
+    const looksLikeScene = (x) => {
+      try {
+        return !!(
+          x &&
+          typeof x === "object" &&
+          x.sys &&
+          x.sys.scene === x &&
+          x.sys.settings &&
+          typeof x.sys.settings.key === "string"
+        );
+      } catch {
+        return false;
+      }
+    };
+
+    const resolveFromScene = (scene) => {
+      // `scene.sys.game` may not be set the instant the scene is pushed; poll briefly.
+      const deadline = Date.now() + 15_000;
+      const tick = () => {
+        if (finished) {
+          return;
+        }
+        const game = scene.sys && scene.sys.game;
+        if (game && game.scene) {
+          captureGame(game);
+        } else if (Date.now() < deadline) {
+          setTimeout(tick, 60);
+        }
+      };
+      tick();
+    };
+
+    function hookedPush(...items) {
+      const result = nativePush.apply(this, items);
+      if (!finished) {
+        for (const item of items) {
+          if (looksLikeScene(item)) {
+            if (Array.prototype.push === hookedPush) {
+              Array.prototype.push = nativePush;
+            }
+            resolveFromScene(item);
+            break;
+          }
+        }
+      }
+      return result;
+    }
+
+    try {
+      Array.prototype.push = hookedPush;
+    } catch (error) {
+      log("Could not install the push capture hook.", error);
+    }
+
+    // --- Strategy 2: window.Phaser fallback ---------------------------------
+    const patchPhaser = (Phaser) => {
+      const proto = Phaser && Phaser.Game && Phaser.Game.prototype;
+      if (!proto) {
+        return;
+      }
+      for (const method of ["boot", "step"]) {
+        const descriptor = Object.getOwnPropertyDescriptor(proto, method);
+        if (!descriptor || typeof descriptor.value !== "function") {
+          continue;
+        }
+        const original = descriptor.value;
+        proto[method] = function (...args) {
+          captureGame(this);
+          return original.apply(this, args);
+        };
+        restorers.push(() => {
+          if (proto[method] !== original) {
+            proto[method] = original;
+          }
+        });
+      }
+    };
+
+    if (window.Phaser) {
+      patchPhaser(window.Phaser);
+    } else {
+      phaserPoll = setInterval(() => {
+        if (finished) {
+          clearInterval(phaserPoll);
+          phaserPoll = null;
+        } else if (window.Phaser) {
+          clearInterval(phaserPoll);
+          phaserPoll = null;
+          patchPhaser(window.Phaser);
+        }
+      }, 100);
+    }
+
+    // Safety net: never leave hooks installed forever.
+    setTimeout(cleanup, CONNECT_TIMEOUT_MS);
+    return cleanup;
+  }
+
+  const getScenes = (game) => {
+    try {
+      if (game && game.scene && typeof game.scene.getScenes === "function") {
+        return game.scene.getScenes(false);
+      }
+      if (game && game.scene && Array.isArray(game.scene.scenes)) {
+        return game.scene.scenes;
+      }
+    } catch {
+      /* ignore */
+    }
+    return [];
+  };
+
+  /** The main gameplay scene, detected by the methods only it has. */
+  const isBattleScene = (scene) =>
+    !!(
+      scene &&
+      typeof scene.addMoney === "function" &&
+      typeof scene.getPlayerParty === "function" &&
+      scene.ui &&
+      scene.phaseManager
+    );
+
+  // ---------------------------------------------------------------------------
+  // Game adapter
+  // ---------------------------------------------------------------------------
+  class PokeRogueApi {
+    constructor(game) {
+      this.game = game;
+      this._scene = null;
+      this._starterCostPatch = null;
+    }
+
+    /** The live BattleScene (re-resolved if the cached reference goes stale). */
+    get scene() {
+      if (this._scene && isBattleScene(this._scene)) {
+        return this._scene;
+      }
+      this._scene = getScenes(this.game).find(isBattleScene) || null;
+      return this._scene;
+    }
+
+    get ready() {
+      return !!this.scene;
+    }
+
+    _requireScene() {
+      const scene = this.scene;
+      if (!scene) {
+        throw new ModMenuError("The game scene is not ready yet.");
+      }
+      return scene;
+    }
+
+    /** The player's party, guaranteed non-empty. */
+    _party() {
+      const scene = this._requireScene();
+      const party = scene.getPlayerParty();
+      if (!Array.isArray(party) || party.length === 0) {
+        throw new ModMenuError("Start or continue a run first.");
+      }
+      return party;
+    }
+
+    _handlers() {
+      const scene = this._requireScene();
+      return Array.isArray(scene.ui && scene.ui.handlers) ? scene.ui.handlers : [];
+    }
+
+    _activeHandler() {
+      const scene = this._requireScene();
+      return typeof scene.ui.getHandler === "function" ? scene.ui.getHandler() : null;
+    }
+
+    _eggGachaHandler() {
+      return this._handlers().find(
+        (h) => h && typeof h.pull === "function" && typeof h.setGachaCursor === "function" && "gachaCursor" in h,
+      );
+    }
+
+    _rewardHandler() {
+      return this._handlers().find(
+        (h) => h && Array.isArray(h.shopOptionsRows) && Array.isArray(h.options) && typeof h.setRerollCost === "function",
+      );
+    }
+
+    // ---- Economy ------------------------------------------------------------
+    addMoney(value) {
+      const amount = asInteger(value, "Money", 1, Number.MAX_SAFE_INTEGER);
+      this._requireScene().addMoney(amount);
+      return `Added ${amount.toLocaleString()} money.`;
+    }
+
+    addMasterBalls(value) {
+      const amount = asInteger(value, "Master Balls", 1, 999_999);
+      const counts = this._requireScene().pokeballCounts;
+      if (!counts || typeof counts !== "object") {
+        throw new ModMenuError("Poké Ball data is only available during a run.");
+      }
+      counts[MASTER_BALL_ID] = (Number(counts[MASTER_BALL_ID]) || 0) + amount;
+      return `Added ${amount.toLocaleString()} Master Ball${amount === 1 ? "" : "s"}.`;
+    }
+
+    /** Toggle a patch that caps every starter's candy cost at `cap` (useful in starter select). */
+    toggleStarterCostCap(cap = 1) {
+      if (this._starterCostPatch) {
+        const { target, original, replacement } = this._starterCostPatch;
+        if (target.getSpeciesStarterValue === replacement) {
+          target.getSpeciesStarterValue = original;
+        }
+        this._starterCostPatch = null;
+        return { enabled: false, message: "Restored normal starter costs." };
+      }
+
+      const gameData = this._requireScene().gameData;
+      if (!gameData || typeof gameData.getSpeciesStarterValue !== "function") {
+        throw new ModMenuError("Starter data is not ready yet.");
+      }
+      const original = gameData.getSpeciesStarterValue;
+      const replacement = function (...args) {
+        const normal = original.apply(this, args); // `this` is gameData at call time
+        return Number.isFinite(normal) ? Math.min(normal, cap) : normal;
+      };
+      gameData.getSpeciesStarterValue = replacement;
+      this._starterCostPatch = { target: gameData, original, replacement };
+      return { enabled: true, message: `Starter costs capped at ${cap} (until reload).` };
+    }
+
+    get starterCostCapped() {
+      return !!this._starterCostPatch;
+    }
+
+    // ---- Party: stats -------------------------------------------------------
+    maximizeLuck() {
+      const party = this._party();
+      for (const pokemon of party) {
+        pokemon.luck = MAX_LUCK;
+      }
+      return `Set luck to SSS for ${party.length} Pokémon.`;
+    }
+
+    maximizeStats({ heal = true } = {}) {
+      const party = this._party();
+      for (const pokemon of party) {
+        if (Array.isArray(pokemon.ivs)) {
+          pokemon.ivs.fill(MAX_IV);
+        } else {
+          pokemon.ivs = new Array(6).fill(MAX_IV);
+        }
+        if (Array.isArray(pokemon.moveset)) {
+          for (const move of pokemon.moveset) {
+            if (!move) {
+              continue;
+            }
+            move.ppUp = MAX_PP_UP;
+            move.ppUsed = 0;
+          }
+        }
+        try {
+          pokemon.calculateStats && pokemon.calculateStats();
+        } catch {
+          /* ignore */
+        }
+        if (heal) {
+          try {
+            const maxHp = pokemon.getMaxHp ? pokemon.getMaxHp() : pokemon.hp;
+            if (Number.isFinite(maxHp)) {
+              pokemon.hp = maxHp;
+            }
+            pokemon.status = null;
+          } catch {
+            /* ignore */
+          }
+        }
+        this._refreshPokemon(pokemon);
+      }
+      return `Maxed IVs & PP${heal ? " and healed" : ""} for ${party.length} Pokémon.`;
+    }
+
+    setLevel(value) {
+      const level = asInteger(value, "Level", 1, 100_000);
+      const party = this._party();
+      for (const pokemon of party) {
+        pokemon.level = level;
+        try {
+          pokemon.calculateStats && pokemon.calculateStats();
+        } catch {
+          /* ignore */
+        }
+        this._refreshPokemon(pokemon);
+      }
+      return `Set level to ${level} for ${party.length} Pokémon.`;
+    }
+
+    // ---- Party: shiny -------------------------------------------------------
+    makeShiny(variantValue, { wholeParty = true } = {}) {
+      const variant = asInteger(variantValue, "Shiny variant", 0, SHINY_VARIANTS.length - 1);
+      const party = this._party();
+      const targets = wholeParty ? party : [party[0]];
+      for (const pokemon of targets) {
+        pokemon.shiny = true;
+        pokemon.variant = variant;
+        if (pokemon.fusionSpecies) {
+          pokemon.fusionShiny = true;
+          pokemon.fusionVariant = variant;
+        }
+        // Best-effort live sprite refresh (data change alone persists & shows on next summon).
+        try {
+          pokemon.initShinySparkle && pokemon.initShinySparkle();
+        } catch {
+          /* off-field Pokémon have no sprite yet; ignore */
+        }
+        try {
+          const result = pokemon.loadAssets && pokemon.loadAssets(false);
+          if (result && typeof result.then === "function") {
+            result.then(() => this._refreshPokemon(pokemon)).catch(() => {});
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+      return `Made ${targets.length} Pokémon shiny (${SHINY_VARIANTS[variant]}). Field sprites refresh shortly.`;
+    }
+
+    _refreshPokemon(pokemon) {
+      try {
+        pokemon.updateInfo && pokemon.updateInfo(true);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    // ---- Per-Pokémon stat editor (party & enemy) ----------------------------
+
+    /** A short display name for a Pokémon, resilient to missing data. */
+    _pokemonLabel(pokemon) {
+      let name = "Pokémon";
+      try {
+        name = (pokemon.getNameToRender && pokemon.getNameToRender()) || pokemon.name || name;
+      } catch {
+        name = pokemon.name || name;
+      }
+      const level = Number.isFinite(pokemon.level) ? ` Lv.${pokemon.level}` : "";
+      const shiny = pokemon.shiny ? " ✨" : "";
+      return `${name}${level}${shiny}`;
+    }
+
+    /** List selectable stat-edit targets across the player party and the current enemies. */
+    listTargets() {
+      const scene = this.scene;
+      const targets = [];
+      if (!scene) {
+        return targets;
+      }
+      const add = (list, side, sideLabel) => {
+        if (!Array.isArray(list)) {
+          return;
+        }
+        list.forEach((pokemon, index) => {
+          if (pokemon) {
+            targets.push({ token: `${side}:${index}`, label: `${sideLabel} ${index + 1} — ${this._pokemonLabel(pokemon)}` });
+          }
+        });
+      };
+      try {
+        add(scene.getPlayerParty && scene.getPlayerParty(), "party", "Party");
+      } catch {
+        /* ignore */
+      }
+      try {
+        add(scene.getEnemyParty && scene.getEnemyParty(), "enemy", "Enemy");
+      } catch {
+        /* ignore */
+      }
+      return targets;
+    }
+
+    /** Resolve a `"party:<i>"` / `"enemy:<i>"` token to a live Pokémon. */
+    _resolveTarget(token) {
+      const scene = this._requireScene();
+      const [side, indexRaw] = String(token || "").split(":");
+      const index = Number(indexRaw);
+      const list = side === "enemy" ? scene.getEnemyParty && scene.getEnemyParty() : scene.getPlayerParty && scene.getPlayerParty();
+      const pokemon = Array.isArray(list) ? list[index] : undefined;
+      if (!pokemon) {
+        throw new ModMenuError("That Pokémon is gone — reload targets and try again.");
+      }
+      return pokemon;
+    }
+
+    /** Read the current editable values of a target (for populating the form). */
+    readStats(token) {
+      const pokemon = this._resolveTarget(token);
+      const ivs = Array.isArray(pokemon.ivs) ? pokemon.ivs.slice(0, 6) : [0, 0, 0, 0, 0, 0];
+      const stats = Array.isArray(pokemon.stats) ? pokemon.stats.slice(0, 6) : [0, 0, 0, 0, 0, 0];
+      let maxHp = stats[0];
+      try {
+        if (typeof pokemon.getMaxHp === "function") {
+          maxHp = pokemon.getMaxHp();
+        }
+      } catch {
+        /* ignore */
+      }
+      return {
+        label: this._pokemonLabel(pokemon),
+        level: Number.isFinite(pokemon.level) ? pokemon.level : 1,
+        nature: typeof pokemon.nature === "number" ? pokemon.nature : 0,
+        ivs,
+        stats,
+        hp: Number.isFinite(pokemon.hp) ? pokemon.hp : maxHp,
+        maxHp,
+      };
+    }
+
+    /**
+     * Apply edits to one Pokémon.
+     * @param token target token
+     * @param opts { mode: "ivs"|"stats", level?, nature?, values?: number[6], heal? }
+     */
+    applyStats(token, opts = {}) {
+      const pokemon = this._resolveTarget(token);
+      const { mode = "ivs", level, nature, values, heal } = opts;
+
+      if (level !== undefined && level !== null && `${level}` !== "") {
+        pokemon.level = asInteger(level, "Level", 1, 100_000);
+      }
+      if (nature !== undefined && nature !== null && `${nature}` !== "") {
+        pokemon.nature = asInteger(nature, "Nature", 0, NATURE_NAMES.length - 1);
+      }
+
+      if (Array.isArray(values) && mode === "ivs") {
+        const ivs = Array.isArray(pokemon.ivs) ? pokemon.ivs : (pokemon.ivs = new Array(6).fill(0));
+        for (let i = 0; i < 6; i++) {
+          ivs[i] = asInteger(values[i], `${STAT_NAMES[i]} IV`, 0, MAX_IV);
+        }
+      }
+
+      // Recalculate from level / nature / IVs.
+      try {
+        pokemon.calculateStats && pokemon.calculateStats();
+      } catch {
+        /* ignore */
+      }
+
+      // In "stats" mode, override the freshly computed values with the exact numbers.
+      if (Array.isArray(values) && mode === "stats") {
+        for (let i = 0; i < 6; i++) {
+          const value = asInteger(values[i], STAT_NAMES[i], 1, Number.MAX_SAFE_INTEGER);
+          if (typeof pokemon.setStat === "function") {
+            pokemon.setStat(i, value); // Stat enum index; setStat ignores <= 0
+          } else if (Array.isArray(pokemon.stats)) {
+            pokemon.stats[i] = value;
+          }
+        }
+      }
+
+      // Keep current HP sane relative to the (possibly new) max.
+      try {
+        const maxHp = pokemon.getMaxHp ? pokemon.getMaxHp() : undefined;
+        if (heal && Number.isFinite(maxHp)) {
+          pokemon.hp = maxHp;
+          pokemon.status = null;
+        } else if (Number.isFinite(maxHp) && pokemon.hp > maxHp) {
+          pokemon.hp = maxHp;
+        }
+      } catch {
+        /* ignore */
+      }
+
+      this._refreshPokemon(pokemon);
+      const note = mode === "stats" ? " (exact values last until the next recalculation)" : "";
+      return `Updated ${this._pokemonLabel(pokemon)}${note}.`;
+    }
+
+    maxIvsTarget(token) {
+      const pokemon = this._resolveTarget(token);
+      if (Array.isArray(pokemon.ivs)) {
+        pokemon.ivs.fill(MAX_IV);
+      } else {
+        pokemon.ivs = new Array(6).fill(MAX_IV);
+      }
+      try {
+        pokemon.calculateStats && pokemon.calculateStats();
+      } catch {
+        /* ignore */
+      }
+      this._refreshPokemon(pokemon);
+      return `Maxed IVs for ${this._pokemonLabel(pokemon)}.`;
+    }
+
+    healTarget(token) {
+      const pokemon = this._resolveTarget(token);
+      try {
+        const maxHp = pokemon.getMaxHp ? pokemon.getMaxHp() : pokemon.hp;
+        if (Number.isFinite(maxHp)) {
+          pokemon.hp = maxHp;
+        }
+        pokemon.status = null;
+      } catch {
+        /* ignore */
+      }
+      this._refreshPokemon(pokemon);
+      return `Healed ${this._pokemonLabel(pokemon)}.`;
+    }
+
+    // ---- Battle actions on the selected target ------------------------------
+
+    /** Set every in-battle stat stage (ATK..EVA) to `value` (−6…+6). */
+    setStatStages(token, value) {
+      const pokemon = this._resolveTarget(token);
+      const stage = asInteger(value, "Stat stage", -6, 6);
+      const stages = typeof pokemon.getStatStages === "function"
+        ? pokemon.getStatStages()
+        : pokemon.summonData && pokemon.summonData.statStages;
+      if (!Array.isArray(stages)) {
+        throw new ModMenuError("Stat stages aren't available — this mainly works on Pokémon on the field.");
+      }
+      for (const stat of BATTLE_STAT_IDS) {
+        if (typeof pokemon.setStatStage === "function") {
+          pokemon.setStatStage(stat, stage);
+        } else {
+          stages[stat - 1] = stage;
+        }
+      }
+      this._refreshPokemon(pokemon);
+      return `Set all stat stages to ${stage > 0 ? "+" : ""}${stage} for ${this._pokemonLabel(pokemon)}.`;
+    }
+
+    /** Apply (or, for value 0, clear) a non-volatile status on the target. */
+    setStatus(token, effectValue) {
+      const pokemon = this._resolveTarget(token);
+      const effect = asInteger(effectValue, "Status", 0, STATUS_NAMES.length - 1);
+      if (effect === 0) {
+        pokemon.status = null;
+        this._refreshPokemon(pokemon);
+        return `Cleared status for ${this._pokemonLabel(pokemon)}.`;
+      }
+      if (typeof pokemon.doSetStatus === "function") {
+        // Pass sleep turns explicitly so we don't depend on the battle RNG being ready.
+        pokemon.doSetStatus(effect, effect === 4 ? 3 : 0);
+      } else {
+        throw new ModMenuError("Can't set status on that Pokémon right now.");
+      }
+      this._refreshPokemon(pokemon);
+      return `${STATUS_NAMES[effect]} applied to ${this._pokemonLabel(pokemon)}.`;
+    }
+
+    /** Set the target's current HP (clamped to its max). */
+    setCurrentHp(token, value) {
+      const pokemon = this._resolveTarget(token);
+      let maxHp;
+      try {
+        maxHp = pokemon.getMaxHp ? pokemon.getMaxHp() : undefined;
+      } catch {
+        maxHp = undefined;
+      }
+      const raw = asInteger(value, "HP", 0, Number.MAX_SAFE_INTEGER);
+      const hp = Number.isFinite(maxHp) ? Math.min(raw, maxHp) : raw; // clamp to max rather than reject
+      pokemon.hp = hp;
+      this._refreshPokemon(pokemon);
+      return `Set ${this._pokemonLabel(pokemon)} to ${hp}${Number.isFinite(maxHp) ? ` / ${maxHp}` : ""} HP.`;
+    }
+
+    // ---- Rewards ------------------------------------------------------------
+    _currentRewardPhase() {
+      const scene = this._requireScene();
+      const phase = scene.phaseManager && scene.phaseManager.getCurrentPhase && scene.phaseManager.getCurrentPhase();
+      if (!phase || phase.phaseName !== "SelectModifierPhase" || !Array.isArray(phase.typeOptions) || phase.typeOptions.length === 0) {
+        throw new ModMenuError("Open the post-wave reward screen first.");
+      }
+      return phase;
+    }
+
+    setRewardTier(tierValue, { autoReroll = true } = {}) {
+      const scene = this._requireScene();
+      const tier = asInteger(tierValue, "Reward tier", 0, REWARD_TIERS.length - 1);
+      const phase = this._currentRewardPhase();
+
+      for (const option of phase.typeOptions) {
+        if (option && option.type) {
+          option.type.tier = tier;
+        }
+      }
+      // Locking makes the reroll carry these tiers into the freshly generated rewards.
+      scene.lockModifierTiers = true;
+      this._refreshRewardUi(phase);
+
+      if (autoReroll && typeof phase.rerollModifiers === "function") {
+        try {
+          const cost = typeof phase.getRerollCost === "function" ? phase.getRerollCost(true) : 0;
+          if (Number.isFinite(cost) && cost > 0 && scene.money < cost) {
+            scene.addMoney(cost - scene.money); // top up so the reroll doesn't fail
+          }
+          phase.rerollModifiers();
+          return `Rerolled rewards as ${REWARD_TIERS[tier]} tier.`;
+        } catch (error) {
+          log("Auto-reroll failed; falling back to manual reroll.", error);
+        }
+      }
+      return `${REWARD_TIERS[tier]} tier locked. Press Reroll once in-game.`;
+    }
+
+    toggleRewardTierLock() {
+      const scene = this._requireScene();
+      scene.lockModifierTiers = !scene.lockModifierTiers;
+      try {
+        this._refreshRewardUi(this._currentRewardPhase());
+      } catch {
+        /* not on the reward screen — the flag still applies next time */
+      }
+      return { enabled: scene.lockModifierTiers, message: `Reward tier lock ${scene.lockModifierTiers ? "ON" : "OFF"}.` };
+    }
+
+    get rewardTierLocked() {
+      const scene = this.scene;
+      return !!(scene && scene.lockModifierTiers);
+    }
+
+    _refreshRewardUi(phase) {
+      const scene = this._requireScene();
+      const handler = this._rewardHandler();
+      if (!handler) {
+        return;
+      }
+      if (phase && typeof phase.getRerollCost === "function" && typeof handler.setRerollCost === "function") {
+        handler.setRerollCost(phase.getRerollCost(scene.lockModifierTiers));
+      }
+      handler.updateLockRaritiesText && handler.updateLockRaritiesText();
+      handler.updateRerollCostText && handler.updateRerollCostText();
+    }
+
+    // ---- Egg gacha ----------------------------------------------------------
+    async pullEggs(countValue, gachaTypeName) {
+      const scene = this._requireScene();
+      const gachaType = GACHA_TYPES[gachaTypeName];
+      if (gachaType === undefined) {
+        throw new ModMenuError("Choose a valid gacha machine.");
+      }
+      const handler = this._eggGachaHandler();
+      if (!handler) {
+        throw new ModMenuError("The Egg Gacha handler is not available.");
+      }
+      if (this._activeHandler() !== handler) {
+        throw new ModMenuError("Open the in-game Egg Gacha screen first.");
+      }
+
+      const current = (scene.gameData && Array.isArray(scene.gameData.eggs) && scene.gameData.eggs.length) || 0;
+      const free = MAX_EGGS - current;
+      const count = asInteger(countValue, "Egg count", 1, Math.max(1, free));
+      if (count > free) {
+        throw new ModMenuError(`Only ${free} egg slot${free === 1 ? "" : "s"} free.`);
+      }
+
+      handler.setGachaCursor(gachaType);
+      await delay(300);
+      await handler.pull(count); // called directly → no vouchers consumed
+      return `Pulled ${count} free ${gachaTypeName} egg${count === 1 ? "" : "s"}.`;
+    }
+
+    destroy() {
+      if (this._starterCostPatch) {
+        const { target, original, replacement } = this._starterCostPatch;
+        if (target.getSpeciesStarterValue === replacement) {
+          target.getSpeciesStarterValue = original;
+        }
+        this._starterCostPatch = null;
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // UI
+  // ---------------------------------------------------------------------------
+  class ModMenu {
+    constructor() {
+      this.config = new ConfigStore();
+      this.api = null;
+      this.host = null;
+      this.shadow = null;
+      this.destroyed = false;
+      this.abort = new AbortController();
+
+      this._onGame = this._onGame.bind(this);
+      this._onKeyDown = this._onKeyDown.bind(this);
+    }
+
+    start() {
+      this._stopCapture = installSceneCapture(this._onGame);
+      this._mount();
+    }
+
+    async _mount() {
+      if (document.readyState === "loading") {
+        await new Promise((resolve) => document.addEventListener("DOMContentLoaded", resolve, { once: true }));
+      }
+      if (this.destroyed) {
+        return;
+      }
+
+      this.host = document.createElement("div");
+      this.host.id = "pokerogue-mod-menu-host";
+      this.shadow = this.host.attachShadow({ mode: "open" });
+      this.shadow.innerHTML = this._markup();
+      document.body.append(this.host);
+
+      this._bindUi();
+      this._updateConnection();
+      window.addEventListener("keydown", this._onKeyDown, { capture: true, signal: this.abort.signal });
+    }
+
+    async _onGame(game) {
+      if (this.destroyed) {
+        return;
+      }
+      this._setStatus("Game found — waiting for the battle scene…", "warning");
+      const deadline = Date.now() + CONNECT_TIMEOUT_MS;
+      while (!this.destroyed && Date.now() < deadline) {
+        const scene = getScenes(game).find(isBattleScene);
+        if (scene) {
+          this.api = new PokeRogueApi(game);
+          this._updateConnection();
+          log(`Connected to the battle scene (${VERSION}).`);
+          return;
+        }
+        await delay(250);
+      }
+      if (!this.destroyed) {
+        this._updateConnection("Loaded, but the battle scene was not found.");
+      }
+    }
+
+    // ---- markup -------------------------------------------------------------
+    _markup() {
+      return /* html */ `
+        <style>
+          :host {
+            --accent:#ef5350; --border:#59657a; --soft:#22293a; --text:#f6f7fb;
+            --muted:#aeb8ca; --success:#58d68d; --warning:#ffd166; --danger:#ff7b7b;
+            color-scheme:dark;
+            font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;
+          }
+          *,*::before,*::after { box-sizing:border-box; }
+          [hidden] { display:none !important; }
+
+          .launcher, .panel { position:fixed; z-index:2147483647; right:max(12px,env(safe-area-inset-right)); top:max(12px,env(safe-area-inset-top)); }
+          .launcher { padding:8px 14px; border:1px solid var(--accent); border-radius:10px; background:rgba(23,27,39,.92); color:var(--text); font-weight:700; cursor:pointer; box-shadow:0 8px 24px rgba(0,0,0,.4); }
+          .launcher:hover { background:#2c3448; }
+
+          .panel {
+            width:min(440px,calc(100vw - 24px)); max-height:calc(100dvh - 24px); overflow:auto;
+            border:1px solid var(--border); border-radius:14px;
+            background:linear-gradient(145deg,rgba(34,41,58,.98),rgba(17,20,30,.98));
+            box-shadow:0 18px 60px rgba(0,0,0,.55);
+          }
+          header { display:flex; align-items:center; justify-content:space-between; gap:12px; position:sticky; top:0; z-index:1; padding:13px 16px; border-bottom:1px solid var(--border); background:rgba(23,27,39,.97); cursor:grab; user-select:none; }
+          header.dragging { cursor:grabbing; }
+          h1 { margin:0; font-size:16px; color:var(--text); }
+          h1 small { color:var(--muted); font-weight:400; font-size:11px; margin-left:6px; }
+          h2 { margin:0 0 9px; color:var(--muted); font-size:11px; letter-spacing:.09em; text-transform:uppercase; }
+          main { display:grid; gap:16px; padding:14px 16px 18px; }
+          section { display:grid; gap:9px; }
+          .grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; }
+          .wide { grid-column:1/-1; }
+          .control { display:grid; gap:4px; }
+          .statgrid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; }
+          .statgrid .control label { font-size:11px; text-align:center; }
+          .statgrid input { padding:6px 4px; text-align:center; }
+          .btnrow { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; }
+          label { color:var(--muted); font-size:12px; }
+
+          button,input,select { min-height:38px; border:1px solid var(--border); border-radius:8px; color:var(--text); background:var(--soft); font:inherit; }
+          button { padding:8px 10px; cursor:pointer; font-weight:650; }
+          button:hover:not(:disabled) { border-color:var(--accent); background:#2c3448; }
+          button:disabled { cursor:not-allowed; opacity:.45; }
+          button[aria-pressed="true"] { border-color:var(--success); color:var(--success); }
+          button:focus-visible,input:focus-visible,select:focus-visible { outline:2px solid var(--warning); outline-offset:2px; }
+          input,select { width:100%; padding:8px 10px; }
+          input[type="number"] { font-variant-numeric:tabular-nums; }
+          .close { min-width:36px; padding:4px; font-size:20px; line-height:1; }
+          .check { display:flex; align-items:center; gap:8px; color:var(--muted); font-size:12px; }
+          .check input { min-height:0; width:auto; }
+
+          .status { padding:9px 11px; border:1px solid var(--border); border-radius:8px; color:var(--muted); background:rgba(0,0,0,.2); font-size:12px; min-height:36px; }
+          .status[data-tone="success"] { border-color:#347653; color:var(--success); }
+          .status[data-tone="warning"] { border-color:#8a7131; color:var(--warning); }
+          .status[data-tone="error"] { border-color:#8f3e45; color:var(--danger); }
+
+          details { border-top:1px solid var(--border); padding-top:12px; }
+          summary { color:var(--muted); cursor:pointer; font-size:13px; }
+          .settings { display:grid; grid-template-columns:1fr auto; gap:8px; margin-top:10px; }
+          .hint { color:var(--muted); font-size:11px; line-height:1.45; }
+
+          @media (max-width:520px) { .grid { grid-template-columns:1fr; } .wide { grid-column:auto; } }
+        </style>
+
+        <button class="launcher" id="launcher" type="button" title="Open PokéRogue mods">⚙ Mods</button>
+        <aside class="panel" id="panel" role="dialog" aria-label="PokéRogue Mod Menu" hidden>
+          <header id="drag-handle">
+            <h1>PokéRogue Mods <small>v${VERSION}</small></h1>
+            <button class="close" id="close" type="button" aria-label="Close">×</button>
+          </header>
+          <main>
+            <p class="status" id="status" role="status" aria-live="polite">Connecting to the game…</p>
+
+            <section>
+              <h2>Party — Stats</h2>
+              <div class="grid">
+                <button data-action="max-stats" data-game type="button">Max IVs, PP &amp; heal</button>
+                <button data-action="max-luck" data-game type="button">Set SSS luck</button>
+                <div class="control">
+                  <label for="level">Level</label>
+                  <input id="level" type="number" min="1" max="100000" step="1">
+                </div>
+                <button data-action="set-level" data-game type="button">Set party level</button>
+              </div>
+            </section>
+
+            <section>
+              <h2>Party — Shiny</h2>
+              <div class="grid">
+                <div class="control">
+                  <label for="shiny-variant">Variant</label>
+                  <select id="shiny-variant">
+                    <option value="0">Standard</option>
+                    <option value="1">Rare</option>
+                    <option value="2">Epic</option>
+                  </select>
+                </div>
+                <button data-action="make-shiny" data-game type="button">Make shiny</button>
+                <label class="check wide"><input id="shiny-whole-party" type="checkbox"> Apply to whole party (off = lead only)</label>
+              </div>
+            </section>
+
+            <section>
+              <h2>Stat Editor — Party &amp; Enemy</h2>
+              <div class="grid">
+                <div class="control wide">
+                  <label for="stat-target">Target</label>
+                  <select id="stat-target"><option value="">Start a run…</option></select>
+                </div>
+                <div class="control">
+                  <label for="stat-level">Level</label>
+                  <input id="stat-level" type="number" min="1" max="100000" step="1">
+                </div>
+                <div class="control">
+                  <label for="stat-nature">Nature</label>
+                  <select id="stat-nature"></select>
+                </div>
+                <div class="control wide">
+                  <label for="stat-mode">Editing</label>
+                  <select id="stat-mode">
+                    <option value="ivs">IVs — 0–31, permanent</option>
+                    <option value="stats">Stat values — this battle</option>
+                  </select>
+                </div>
+                <div class="statgrid wide">
+                  <div class="control"><label for="stat-0">HP</label><input id="stat-0" data-stat="0" type="number" min="0" step="1"></div>
+                  <div class="control"><label for="stat-1">Atk</label><input id="stat-1" data-stat="1" type="number" min="0" step="1"></div>
+                  <div class="control"><label for="stat-2">Def</label><input id="stat-2" data-stat="2" type="number" min="0" step="1"></div>
+                  <div class="control"><label for="stat-3">SpA</label><input id="stat-3" data-stat="3" type="number" min="0" step="1"></div>
+                  <div class="control"><label for="stat-4">SpD</label><input id="stat-4" data-stat="4" type="number" min="0" step="1"></div>
+                  <div class="control"><label for="stat-5">Spe</label><input id="stat-5" data-stat="5" type="number" min="0" step="1"></div>
+                </div>
+                <button data-action="stats-apply" data-game type="button">Apply</button>
+                <button data-action="stats-max-ivs" data-game type="button">Max IVs</button>
+                <button data-action="stats-heal" data-game type="button">Heal to full</button>
+                <button data-action="stats-reload" data-game type="button">↻ Reload</button>
+              </div>
+              <p class="hint">Pick any party member or current enemy, edit, then Apply. <b>IVs</b> are permanent; <b>Stat values</b> set exact numbers that last until the game recalculates (level-up, switch, form change). Level &amp; Nature apply in both modes.</p>
+            </section>
+
+            <section>
+              <h2>Battle — Selected Target</h2>
+              <div class="grid">
+                <div class="control wide">
+                  <label>Stat stages (Atk/Def/SpA/SpD/Spe/Acc/Eva)</label>
+                  <div class="btnrow">
+                    <button data-action="stages-up" data-game type="button">All +6</button>
+                    <button data-action="stages-reset" data-game type="button">Reset 0</button>
+                    <button data-action="stages-down" data-game type="button">All −6</button>
+                  </div>
+                </div>
+                <div class="control">
+                  <label for="status-effect">Status</label>
+                  <select id="status-effect">
+                    <option value="0">None (clear)</option>
+                    <option value="4">Sleep</option>
+                    <option value="1">Poison</option>
+                    <option value="2">Toxic (bad poison)</option>
+                    <option value="3">Paralysis</option>
+                    <option value="5">Freeze</option>
+                    <option value="6">Burn</option>
+                  </select>
+                </div>
+                <button data-action="set-status" data-game type="button">Set status</button>
+                <div class="control">
+                  <label for="cur-hp">Current HP</label>
+                  <input id="cur-hp" type="number" min="0" step="1">
+                </div>
+                <button data-action="set-hp" data-game type="button">Set HP</button>
+                <button class="wide" data-action="hp-one" data-game type="button">Set HP to 1 (set up a one-shot)</button>
+              </div>
+              <p class="hint">Acts on the target chosen in the Stat Editor above. Stat stages &amp; HP mainly matter for Pokémon currently on the field — great for debuffing an enemy (−6) or one-shot setups.</p>
+            </section>
+
+            <section>
+              <h2>Rewards</h2>
+              <div class="grid">
+                <div class="control">
+                  <label for="reward-tier">Tier</label>
+                  <select id="reward-tier">
+                    <option value="0">Common</option>
+                    <option value="1">Great</option>
+                    <option value="2">Ultra</option>
+                    <option value="3">Rogue</option>
+                    <option value="4">Master</option>
+                  </select>
+                </div>
+                <button data-action="set-reward-tier" data-game type="button">Set rarity</button>
+                <label class="check wide"><input id="auto-reroll" type="checkbox"> Auto-reroll now (tops up money if needed)</label>
+                <button class="wide" data-action="toggle-reward-lock" data-game type="button" aria-pressed="false">Toggle tier lock</button>
+              </div>
+              <p class="hint">Use on the post-wave reward screen. With auto-reroll off: this locks the tier, then press the game's Reroll once.</p>
+            </section>
+
+            <section>
+              <h2>Egg Gacha</h2>
+              <div class="grid">
+                <div class="control">
+                  <label for="egg-count">Eggs (10→rare, 25→epic)</label>
+                  <input id="egg-count" type="number" min="1" max="99" step="1">
+                </div>
+                <div class="control">
+                  <label for="gacha-type">Machine</label>
+                  <select id="gacha-type">
+                    <option value="move">Move</option>
+                    <option value="legendary">Legendary</option>
+                    <option value="shiny">Shiny</option>
+                  </select>
+                </div>
+                <button class="wide" data-action="pull-eggs" data-game type="button">Pull free eggs</button>
+              </div>
+              <p class="hint">Open the in-game Egg Gacha screen first. No vouchers are consumed.</p>
+            </section>
+
+            <section>
+              <h2>Economy</h2>
+              <div class="grid">
+                <div class="control">
+                  <label for="money">Money</label>
+                  <input id="money" type="number" min="1" max="9007199254740991" step="1">
+                </div>
+                <button data-action="add-money" data-game type="button">Add money</button>
+                <div class="control">
+                  <label for="master-balls">Master Balls</label>
+                  <input id="master-balls" type="number" min="1" max="999999" step="1">
+                </div>
+                <button data-action="add-master-balls" data-game type="button">Add Master Balls</button>
+                <button class="wide" data-action="starter-costs" data-game type="button" aria-pressed="false">Cap starter costs at 1</button>
+              </div>
+            </section>
+
+            <details>
+              <summary>Settings</summary>
+              <div class="settings">
+                <div class="control">
+                  <label for="toggle-key">Menu toggle key</label>
+                  <input id="toggle-key" type="text" readonly autocomplete="off" spellcheck="false" placeholder="Click, then press a key">
+                </div>
+                <button id="save-key" type="button">Save</button>
+              </div>
+              <p class="hint">Click the field and press any key (modifiers like Ctrl/Alt work too). Default: the <b>\`</b> key above Tab. No suitable key? The <b>⚙ Mods</b> button always opens the menu.</p>
+            </details>
+          </main>
+        </aside>
+      `;
+    }
+
+    // ---- wiring -------------------------------------------------------------
+    _bindUi() {
+      const signal = this.abort.signal;
+      const $ = (id) => this.shadow.getElementById(id);
+
+      $("launcher").addEventListener("click", () => this._setOpen(true), { signal });
+      $("close").addEventListener("click", () => this._setOpen(false), { signal });
+      $("save-key").addEventListener("click", () => this._saveToggleKey(), { signal });
+      this.shadow.addEventListener("click", (event) => this._onActionClick(event), { signal });
+
+      // Restore remembered field values.
+      $("money").value = this.config.get("money");
+      $("master-balls").value = this.config.get("masterBalls");
+      $("egg-count").value = this.config.get("eggCount");
+      $("gacha-type").value = this.config.get("gachaType");
+      $("reward-tier").value = this.config.get("rewardTier");
+      $("auto-reroll").checked = !!this.config.get("autoReroll");
+      $("shiny-variant").value = this.config.get("shinyVariant");
+      $("shiny-whole-party").checked = !!this.config.get("shinyWholeParty");
+      $("level").value = this.config.get("level");
+
+      // Toggle-key binding: show its label and prime the pending value.
+      this._pendingBinding = normalizeBinding(this.config.get("toggleBinding"));
+      $("toggle-key").value = bindingLabel(this._pendingBinding);
+      this._refreshLauncherHint();
+
+      // Persist values as they change.
+      const remember = (id, key, transform = (v) => v) =>
+        $(id).addEventListener("change", (e) => {
+          const el = e.target;
+          this.config.set(key, transform(el.type === "checkbox" ? el.checked : el.value));
+        }, { signal });
+      remember("money", "money");
+      remember("master-balls", "masterBalls");
+      remember("egg-count", "eggCount");
+      remember("gacha-type", "gachaType");
+      remember("reward-tier", "rewardTier", Number);
+      remember("auto-reroll", "autoReroll");
+      remember("shiny-variant", "shinyVariant", Number);
+      remember("shiny-whole-party", "shinyWholeParty");
+      remember("level", "level");
+      remember("stat-mode", "statMode");
+
+      // Stat editor: fill the nature list, restore the editing mode, and react to changes.
+      this._populateNatures();
+      $("stat-mode").value = this.config.get("statMode") || "ivs";
+      $("stat-target").addEventListener("change", () => this._loadStatForm(true), { signal });
+      $("stat-mode").addEventListener("change", () => this._loadStatForm(false), { signal });
+      this._populateTargets();
+
+      // Capture the next keystroke (with modifiers) as the pending toggle binding.
+      $("toggle-key").addEventListener("keydown", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (["Tab", "Escape"].includes(event.key) || ["Control", "Alt", "Shift", "Meta"].includes(event.key)) {
+          return; // let Tab/Escape work; ignore lone modifier presses
+        }
+        this._pendingBinding = {
+          code: event.code,
+          key: event.key,
+          ctrl: event.ctrlKey,
+          alt: event.altKey,
+          shift: event.shiftKey,
+          meta: event.metaKey,
+        };
+        event.target.value = bindingLabel(this._pendingBinding);
+      }, { signal });
+
+      this._makeDraggable($("drag-handle"), $("panel"));
+    }
+
+    _refreshLauncherHint() {
+      const launcher = this.shadow && this.shadow.getElementById("launcher");
+      if (launcher) {
+        launcher.title = `Open PokéRogue mods (${bindingLabel(normalizeBinding(this.config.get("toggleBinding")))})`;
+      }
+    }
+
+    // ---- Stat editor UI -----------------------------------------------------
+    _populateNatures() {
+      const select = this.shadow && this.shadow.getElementById("stat-nature");
+      if (!select || select.options.length) {
+        return;
+      }
+      NATURE_NAMES.forEach((name, index) => {
+        const option = document.createElement("option");
+        option.value = String(index);
+        option.textContent = name;
+        select.append(option);
+      });
+    }
+
+    /** Rebuild the target dropdown from the live party/enemy lists. Returns a status message. */
+    _populateTargets() {
+      const select = this.shadow && this.shadow.getElementById("stat-target");
+      if (!select) {
+        return "";
+      }
+      const previous = select.value;
+      const targets = this.api && this.api.ready ? this.api.listTargets() : [];
+      select.textContent = "";
+      if (!targets.length) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = this.api && this.api.ready ? "No Pokémon — start a run" : "Connecting…";
+        select.append(option);
+        this._clearStatForm();
+        return this.api && this.api.ready ? "No Pokémon to edit — start a run." : "Still connecting…";
+      }
+      for (const target of targets) {
+        const option = document.createElement("option");
+        option.value = target.token;
+        option.textContent = target.label; // textContent = injection-safe
+        select.append(option);
+      }
+      if (targets.some((t) => t.token === previous)) {
+        select.value = previous;
+      }
+      this._loadStatForm(true);
+      return `Loaded ${targets.length} target${targets.length === 1 ? "" : "s"}.`;
+    }
+
+    /** Fill the editor inputs from the selected target. `refreshAll` also reloads level/nature. */
+    _loadStatForm(refreshAll = true) {
+      if (!this.api || !this.api.ready || !this.shadow) {
+        return;
+      }
+      const token = this.shadow.getElementById("stat-target").value;
+      if (!token) {
+        return;
+      }
+      let data;
+      try {
+        data = this.api.readStats(token);
+      } catch {
+        return; // stale target; leave the form as-is
+      }
+      if (refreshAll) {
+        this.shadow.getElementById("stat-level").value = data.level;
+        this.shadow.getElementById("stat-nature").value = String(data.nature);
+        const curHp = this.shadow.getElementById("cur-hp");
+        if (curHp) {
+          curHp.value = data.hp;
+          if (Number.isFinite(data.maxHp)) {
+            curHp.max = data.maxHp;
+          }
+        }
+      }
+      const mode = this.shadow.getElementById("stat-mode").value;
+      const source = mode === "stats" ? data.stats : data.ivs;
+      for (let i = 0; i < 6; i++) {
+        const input = this.shadow.getElementById(`stat-${i}`);
+        if (input) {
+          input.value = source[i];
+        }
+      }
+    }
+
+    _clearStatForm() {
+      if (!this.shadow) {
+        return;
+      }
+      for (const id of ["stat-level", "cur-hp", "stat-0", "stat-1", "stat-2", "stat-3", "stat-4", "stat-5"]) {
+        const element = this.shadow.getElementById(id);
+        if (element) {
+          element.value = "";
+        }
+      }
+    }
+
+    _makeDraggable(handle, panel) {
+      let startX = 0, startY = 0, originLeft = 0, originTop = 0, dragging = false;
+      const onMove = (e) => {
+        if (!dragging) {
+          return;
+        }
+        const left = Math.max(0, Math.min(window.innerWidth - 40, originLeft + (e.clientX - startX)));
+        const top = Math.max(0, Math.min(window.innerHeight - 40, originTop + (e.clientY - startY)));
+        panel.style.left = `${left}px`;
+        panel.style.top = `${top}px`;
+        panel.style.right = "auto";
+      };
+      const onUp = () => {
+        dragging = false;
+        handle.classList.remove("dragging");
+        window.removeEventListener("pointermove", onMove);
+        window.removeEventListener("pointerup", onUp);
+      };
+      handle.addEventListener("pointerdown", (e) => {
+        if (e.target.closest("button")) {
+          return; // don't start a drag from the close button
+        }
+        dragging = true;
+        handle.classList.add("dragging");
+        const rect = panel.getBoundingClientRect();
+        startX = e.clientX; startY = e.clientY; originLeft = rect.left; originTop = rect.top;
+        window.addEventListener("pointermove", onMove);
+        window.addEventListener("pointerup", onUp);
+      }, { signal: this.abort.signal });
+    }
+
+    /** The single source of truth for what each button does. Add features here. */
+    get ACTIONS() {
+      const v = (id) => this.shadow.getElementById(id).value;
+      const checked = (id) => this.shadow.getElementById(id).checked;
+      const requireTarget = () => {
+        const token = v("stat-target");
+        if (!token) {
+          throw new ModMenuError("Pick a target Pokémon first.");
+        }
+        return token;
+      };
+      return {
+        "max-stats": () => this.api.maximizeStats({ heal: true }),
+        "max-luck": () => this.api.maximizeLuck(),
+        "set-level": () => this.api.setLevel(v("level")),
+        "make-shiny": () => this.api.makeShiny(v("shiny-variant"), { wholeParty: checked("shiny-whole-party") }),
+        "stats-apply": () => {
+          const token = requireTarget();
+          const values = [0, 1, 2, 3, 4, 5].map((i) => v(`stat-${i}`));
+          const result = this.api.applyStats(token, {
+            mode: v("stat-mode"),
+            level: v("stat-level"),
+            nature: v("stat-nature"),
+            values,
+          });
+          this._loadStatForm(true);
+          return result;
+        },
+        "stats-max-ivs": () => {
+          const result = this.api.maxIvsTarget(requireTarget());
+          this._loadStatForm(true);
+          return result;
+        },
+        "stats-heal": () => {
+          const result = this.api.healTarget(requireTarget());
+          this._loadStatForm(true);
+          return result;
+        },
+        "stats-reload": () => this._populateTargets(),
+        "stages-up": () => this.api.setStatStages(requireTarget(), 6),
+        "stages-reset": () => this.api.setStatStages(requireTarget(), 0),
+        "stages-down": () => this.api.setStatStages(requireTarget(), -6),
+        "set-status": () => this.api.setStatus(requireTarget(), v("status-effect")),
+        "set-hp": () => {
+          const result = this.api.setCurrentHp(requireTarget(), v("cur-hp"));
+          this._loadStatForm(true);
+          return result;
+        },
+        "hp-one": () => {
+          const result = this.api.setCurrentHp(requireTarget(), 1);
+          this._loadStatForm(true);
+          return result;
+        },
+        "set-reward-tier": () => this.api.setRewardTier(v("reward-tier"), { autoReroll: checked("auto-reroll") }),
+        "toggle-reward-lock": () => this.api.toggleRewardTierLock(),
+        "pull-eggs": () => this.api.pullEggs(v("egg-count"), v("gacha-type")),
+        "add-money": () => this.api.addMoney(v("money")),
+        "add-master-balls": () => this.api.addMasterBalls(v("master-balls")),
+        "starter-costs": () => this.api.toggleStarterCostCap(1),
+      };
+    }
+
+    async _onActionClick(event) {
+      const button = event.target.closest && event.target.closest("[data-action]");
+      if (!button || !this.shadow.contains(button)) {
+        return;
+      }
+      const action = this.ACTIONS[button.dataset.action];
+      if (!action) {
+        return;
+      }
+      if (!this.api || !this.api.ready) {
+        this._setStatus("Still connecting to the game…", "warning");
+        return;
+      }
+
+      button.disabled = true;
+      try {
+        const result = await action();
+        this._setStatus(typeof result === "string" ? result : result.message, "success");
+      } catch (error) {
+        const message = error instanceof ModMenuError ? error.message : "That didn't work in the current game state.";
+        this._setStatus(message, "error");
+        if (!(error instanceof ModMenuError)) {
+          console.error(`[${SCRIPT_NAME}]`, error);
+        }
+      } finally {
+        button.disabled = false;
+        this._syncToggles();
+        // Drop focus so a later gameplay Space/Enter doesn't re-trigger this button.
+        try {
+          button.blur();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+
+    // ---- state --------------------------------------------------------------
+    _updateConnection(errorMessage) {
+      if (!this.shadow) {
+        return;
+      }
+      const connected = !!(this.api && this.api.ready);
+      for (const button of this.shadow.querySelectorAll("[data-game]")) {
+        button.disabled = !connected;
+      }
+      if (errorMessage) {
+        this._setStatus(errorMessage, "error");
+      } else if (connected) {
+        this._setStatus("Connected. Changes affect the current run.", "success");
+      } else {
+        this._setStatus("Connecting to the game…", "warning");
+      }
+      if (connected) {
+        this._populateTargets();
+      }
+      this._syncToggles();
+    }
+
+    _syncToggles() {
+      if (!this.shadow) {
+        return;
+      }
+      const starter = this.shadow.querySelector('[data-action="starter-costs"]');
+      const lock = this.shadow.querySelector('[data-action="toggle-reward-lock"]');
+      const starterOn = !!(this.api && this.api.starterCostCapped);
+      const lockOn = !!(this.api && this.api.rewardTierLocked);
+      if (starter) {
+        starter.setAttribute("aria-pressed", String(starterOn));
+        starter.textContent = starterOn ? "Restore normal starter costs" : "Cap starter costs at 1";
+      }
+      if (lock) {
+        lock.setAttribute("aria-pressed", String(lockOn));
+      }
+    }
+
+    _saveToggleKey() {
+      const binding = this._pendingBinding;
+      if (!binding || (!binding.code && !binding.key)) {
+        this._setStatus("Click the field and press a key first.", "error");
+        return;
+      }
+      this.config.set("toggleBinding", binding);
+      this._refreshLauncherHint();
+      this._setStatus(`Menu key set to "${bindingLabel(binding)}".`, "success");
+      this._returnFocusToGame();
+    }
+
+    _onKeyDown(event) {
+      if (event.repeat) {
+        return;
+      }
+      const panel = this.shadow && this.shadow.getElementById("panel");
+      if (event.key === "Escape" && panel && !panel.hidden) {
+        event.preventDefault();
+        event.stopPropagation();
+        this._setOpen(false);
+        return;
+      }
+      const target = (event.composedPath && event.composedPath()[0]) || event.target;
+      const typing = target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName));
+      if (typing) {
+        return;
+      }
+      if (bindingMatches(normalizeBinding(this.config.get("toggleBinding")), event)) {
+        event.preventDefault();
+        event.stopPropagation();
+        this._setOpen(panel ? panel.hidden : true);
+      }
+    }
+
+    _setOpen(open) {
+      const panel = this.shadow && this.shadow.getElementById("panel");
+      const launcher = this.shadow && this.shadow.getElementById("launcher");
+      if (!panel || !launcher) {
+        return;
+      }
+      panel.hidden = !open;
+      launcher.hidden = open;
+      if (open) {
+        this._syncToggles();
+        this._populateTargets(); // party/enemy may have changed since last open
+      }
+      // Never keep a mod-menu control focused: PokéRogue is played with Space/Enter/arrows,
+      // and a focused button would be "clicked" by those keys during gameplay. Hand focus back.
+      this._returnFocusToGame();
+    }
+
+    /** Drop focus from any mod-menu control so gameplay keys reach the game, not our buttons. */
+    _returnFocusToGame() {
+      try {
+        const active = this.shadow && this.shadow.activeElement;
+        if (active && typeof active.blur === "function") {
+          active.blur();
+        }
+      } catch {
+        /* ignore */
+      }
+      try {
+        const canvas = document.querySelector("#app canvas") || document.querySelector("canvas");
+        if (canvas && typeof canvas.focus === "function") {
+          canvas.focus({ preventScroll: true });
+        } else if (document.activeElement && document.activeElement !== document.body) {
+          document.activeElement.blur();
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    _setStatus(message, tone = "warning") {
+      const status = this.shadow && this.shadow.getElementById("status");
+      if (status) {
+        status.textContent = message;
+        status.dataset.tone = tone;
+      }
+    }
+
+    destroy() {
+      if (this.destroyed) {
+        return;
+      }
+      this.destroyed = true;
+      this._stopCapture && this._stopCapture();
+      this.abort.abort();
+      this.api && this.api.destroy();
+      this.host && this.host.remove();
+      if (globalThis[GLOBAL_KEY] === this) {
+        delete globalThis[GLOBAL_KEY];
+      }
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Bootstrap
+  // ---------------------------------------------------------------------------
+  try {
+    globalThis[GLOBAL_KEY] && globalThis[GLOBAL_KEY].destroy && globalThis[GLOBAL_KEY].destroy();
+  } catch {
+    /* ignore */
+  }
+  const app = new ModMenu();
+  globalThis[GLOBAL_KEY] = app;
+  app.start();
+})();</script>
 </body>
 </html>
